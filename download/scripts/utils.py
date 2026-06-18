@@ -1,6 +1,6 @@
 """download — 学术文献批量检索下载工具集
 
-共享工具函数：Chrome连接、参数解析、文件操作、控制台输出、失败记录导出Excel
+共享工具函数：Chrome连接、参数解析、文件操作、控制台输出
 """
 
 import sys
@@ -9,7 +9,6 @@ import re
 import json
 import time
 import urllib.parse
-import csv
 
 
 # ── 控制台输出 ────────────────────────────────────────────────────────────
@@ -105,62 +104,6 @@ def ensure_output_dir(path):
         return None
     os.makedirs(path, exist_ok=True)
     return path
-
-
-# ── 下载失败记录 + 导出 Excel ──────────────────────────────────────────────
-
-class FailedRecord:
-    """记录下载失败的论文信息，支持最后汇总导出 Excel/CSV"""
-
-    def __init__(self):
-        self.records = []  # [{title, doi, link, source, reason}, ...]
-
-    def add(self, title="", doi="", link="", source="", reason=""):
-        self.records.append({
-            "title": title,
-            "doi": doi,
-            "link": link,
-            "source": source,
-            "reason": reason,
-        })
-
-    @property
-    def count(self):
-        return len(self.records)
-
-    def save_xlsx(self, output_dir, filename="失败记录.xlsx"):
-        """导出为 Excel (.xlsx)，回退到 .csv"""
-        if not self.records:
-            return None
-
-        filepath = os.path.join(output_dir, filename)
-        os.makedirs(output_dir, exist_ok=True)
-
-        try:
-            from openpyxl import Workbook
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "失败记录"
-            # 表头
-            headers = ["序号", "论文标题", "DOI", "链接", "来源", "失败原因"]
-            ws.append(headers)
-            for i, r in enumerate(self.records, 1):
-                ws.append([i, r["title"], r["doi"], r["link"], r["source"], r["reason"]])
-            # 调整列宽
-            for col in ws.columns:
-                max_len = max((len(str(cell.value or "")) for cell in col), default=10)
-                ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
-            wb.save(filepath)
-            return filepath
-        except ImportError:
-            # 无 openpyxl，回退到 CSV
-            csv_path = filepath.replace(".xlsx", ".csv")
-            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow(["序号", "论文标题", "DOI", "链接", "来源", "失败原因"])
-                for i, r in enumerate(self.records, 1):
-                    writer.writerow([i, r["title"], r["doi"], r["link"], r["source"], r["reason"]])
-            return csv_path
 
 
 # ── Chrome CDP 连接 (Playwright) ──────────────────────────────────────────

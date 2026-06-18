@@ -15,7 +15,7 @@ import re
 import sys
 import urllib.parse
 
-from utils import sp, log, safe_filename, save_json, ensure_output_dir, connect_playwright_async, FailedRecord
+from utils import sp, log, safe_filename, save_json, ensure_output_dir, connect_playwright_async
 
 
 DEFAULT_COUNT = 10
@@ -180,7 +180,7 @@ async def try_scihub(page, doi):
     return None
 
 
-async def download_papers(page, papers, output_dir, count, failed):
+async def download_papers(page, papers, output_dir, count):
     """批量下载 PDF，返回成功数"""
     downloaded = 0
     for i, paper in enumerate(papers[:count]):
@@ -197,7 +197,6 @@ async def download_papers(page, papers, output_dir, count, failed):
         doc_match = re.search(r"/document/(\d+)", link)
         doc_id = doc_match.group(1) if doc_match else None
         if not doc_id:
-            failed.add(title=title, link=link, source="IEEE", reason="No document ID in URL")
             log("IEEE", "    No document ID")
             continue
 
@@ -237,9 +236,6 @@ async def download_papers(page, papers, output_dir, count, failed):
                 log("IEEE", f"    DOWNLOADED via Sci-Hub ({len(content)} bytes)")
                 downloaded += 1
                 continue
-            failed.add(title=title, doi=doi, link=link, source="IEEE", reason="Sci-Hub also failed")
-        else:
-            failed.add(title=title, link=link, source="IEEE", reason="No DOI found, cannot try Sci-Hub")
 
         log("IEEE", "    Not available (no open access)")
 
@@ -279,13 +275,12 @@ async def main_async(args_text: str):
 
         save_json(papers[: params["count"]], os.path.join(output_dir, "papers_list.json"))
 
-        failed = FailedRecord()
-        dl_count = await download_papers(page, papers, output_dir, params["count"], failed)
+        dl_count = await download_papers(page, papers, output_dir, params["count"])
 
         log("IEEE", f"Done! Papers found: {len(papers)}, PDFs downloaded: {dl_count}/{min(params['count'], len(papers))}")
-        if failed.count > 0:
-            xlsx = failed.save_xlsx(output_dir)
-            log("IEEE", f"Failed records saved: {xlsx} ({failed.count} papers)")
+        if dl_count < min(params["count"], len(papers)):
+            log("IEEE", "Undownloaded papers may require IEEE institutional subscription.")
+            log("IEEE", "Try with a university network or VPN for full access.")
 
     finally:
         await browser.close()
