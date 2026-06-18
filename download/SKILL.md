@@ -2,6 +2,21 @@
 
 通过 Chrome CDP / Playwright / WebSocket 操控浏览器，自动搜索并下载学术文献。支持 7 种方式覆盖 6 个数据库源：Springer Link (async/sync)、CNKI 知网、IEEE Xplore、EBSCOhost、Web of Science、Sci-Hub。
 
+## 需要 VPN 的源（CNKI / EBSCO / WoS）工作流程
+
+这些数据库需要通过学校 WebVPN 访问，**必须用户手动登录**，流程如下：
+
+1. Claude 打开 Chrome 并导航到 VPN 登录页面 / 数据库页面
+2. **停止操作**，通知用户去浏览器中登录 VPN
+3. 用户登录完成后，告诉 Claude "已登录 + 筛选条件"
+4. Claude 收到确认后再执行搜索 → 筛选 → 下载
+
+**关键：** 用户登录期间 Claude 不会操控浏览器任何页面，避免干扰登录会话。
+
+## 不需要 VPN 的源（Springer / IEEE / Sci-Hub）
+
+全自动执行，无需用户干预。
+
 ## 快速开始
 
 ### 1. 启动 Chrome 调试模式
