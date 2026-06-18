@@ -15,7 +15,7 @@ import re
 import json
 import urllib.parse
 
-from utils import sp, log, safe_filename, ensure_output_dir, FailedRecord
+from utils import sp, log, safe_filename, ensure_output_dir
 
 
 DEFAULT_COUNT = 20
@@ -192,7 +192,7 @@ def get_articles(page, count):
     return articles
 
 
-def download_articles(context, articles, count, output_dir, failed):
+def download_articles(context, articles, count, output_dir):
     """批量下载文献"""
     actual = min(count, len(articles))
     log("CNKI", f"Downloading {actual} papers to {output_dir}")
@@ -209,7 +209,7 @@ def download_articles(context, articles, count, output_dir, failed):
         except Exception:
             pass
 
-    success, fail_count = 0, 0
+    success, failed = 0, 0
     for idx in range(actual):
         art = articles[idx]
         title = art["title"]
@@ -241,20 +241,18 @@ def download_articles(context, articles, count, output_dir, failed):
                 log("CNKI", "  ⚠ CAJ download triggered")
                 success += 1
             else:
-                failed.add(title=title, link=href, source="CNKI", reason="No PDF/CAJ download button on detail page")
                 log("CNKI", "  ✗ No PDF/CAJ button found")
-                fail_count += 1
+                failed += 1
 
             time.sleep(5)
             tab.close()
             time.sleep(1)
         except Exception as e:
-            failed.add(title=title, link=href, source="CNKI", reason=str(e)[:60])
             log("CNKI", f"  ✗ Error: {str(e)[:60]}")
-            fail_count += 1
+            failed += 1
 
-    log("CNKI", f"Done: {success} success, {fail_count} failed")
-    return success, fail_count
+    log("CNKI", f"Done: {success} success, {failed} failed")
+    return success, failed
 
 
 def main(args_text: str):
@@ -300,11 +298,7 @@ def main(args_text: str):
             log("CNKI", "Cancelled")
             return
 
-        failed_rec = FailedRecord()
-        download_articles(context, articles, params["count"], output_dir, failed_rec)
-        if failed_rec.count > 0:
-            xlsx = failed_rec.save_xlsx(output_dir)
-            log("CNKI", f"Failed records saved: {xlsx} ({failed_rec.count} papers)")
+        download_articles(context, articles, params["count"], output_dir)
 
     finally:
         browser.close()

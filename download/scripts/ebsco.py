@@ -17,7 +17,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 
-from utils import sp, log, safe_filename, ensure_output_dir, FailedRecord
+from utils import sp, log, safe_filename, ensure_output_dir
 
 
 DEFAULT_COUNT = 10
@@ -290,7 +290,7 @@ class EBSCODownloader:
             f.write(pdf_bytes)
         return True
 
-    def batch_download(self, articles, target_count, failed):
+    def batch_download(self, articles, target_count):
         downloaded = []
         for i, article in enumerate(articles):
             if len(downloaded) >= target_count:
@@ -310,7 +310,6 @@ class EBSCODownloader:
 
             pdf_url = self.get_pdf_url(rec_id)
             if not pdf_url:
-                failed.add(title=title, source="EBSCO", reason=f"No PDF URL from linkprocessor API (recordId={rec_id})")
                 log("EBSCO", "  no PDF available")
                 continue
 
@@ -320,7 +319,6 @@ class EBSCODownloader:
                 downloaded.append({"file": fname, "title": title, "size_kb": round(sz / 1024)})
                 log("EBSCO", f"  ✓ {sz//1024}KB [{len(downloaded)}/{target_count}]")
             else:
-                failed.add(title=title, link=pdf_url, source="EBSCO", reason="Download failed (small/empty PDF via printToPDF)")
                 log("EBSCO", "  ✗ download failed")
             time.sleep(2)
 
@@ -378,13 +376,9 @@ def main(args_text: str):
         sp(f"  [{a['id']}] {a['title'][:60]}")
 
     log("EBSCO", f"Downloading up to {params['count']} papers...")
-    failed = FailedRecord()
-    results = downloader.batch_download(articles, params["count"], failed)
+    results = downloader.batch_download(articles, params["count"])
 
     log("EBSCO", f"Done! Downloaded {len(results)} papers to {os.path.abspath(output_dir)}")
-    if failed.count > 0:
-        xlsx = failed.save_xlsx(output_dir)
-        log("EBSCO", f"Failed records saved: {xlsx} ({failed.count} papers)")
     for r in results:
         sp(f"  {r['file']}  ({r['size_kb']} KB)")
 
