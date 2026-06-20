@@ -10,24 +10,30 @@ download — 学术文献批量检索下载工具集 (Unified Launcher)
   sl        Springer Link — OA搜索 + PDF下载
   cnki      CNKI 知网 — 筛选 + PDF/CAJ下载
   ieee      IEEE Xplore — 搜索 + PDF下载 (含 Sci-Hub 回退)
-  ieee-vpn  IEEE Xplore (VPN) — 浏览器 VPN 管道 PDF 下载
   ebsco     EBSCOhost — VPN搜索 + PDF下载
+  wos       Web of Science — 期刊/OA筛选 + PDF下载
+  wiley     Wiley Online Library — 搜索 + PDF下载
   scihub    Sci-Hub — DOI/标题/关键词搜索 + PDF下载
-  wiley     Wiley Online Library — VPN+OA搜索+pdfdirect下载
-  openalex  OpenAlex — API搜索+浏览器3层PDF下载+失败记录
-  semantic  Semantic Scholar — 浏览器搜索+OA筛选+PDF下载+失败记录
-  crossref  Crossref — 元数据搜索+OA PDF下载+失败记录
+  openalex  OpenAlex — API搜索 + PDF下载
+  oa        openalex 别名
+  crossref  Crossref — API搜索 + PDF下载
+  cr        crossref 别名
+  semantic  Semantic Scholar — 搜索 + PDF下载
+  ss        semantic 别名
+  sd        ScienceDirect — OA搜索 + PDF下载 (VPN)
+  sciencedirect  sd 的别名
 
 示例:
   python main.py sl "reinforcement learning | 2024 2026 | relevance | 10"
   python main.py cnki "深度学习 | 2024 2026 | CSSCI,SCI | 被引 | 20"
   python main.py ieee "transformer | 2022 2025 | citations | 15"
   python main.py ebsco "FinTech | 2016 2026 | 20 | ./papers | webvpn.upc.edu.cn"
+  python main.py wos "fintech | 2022 2025 | 10 | ./WoS_Results"
+  python main.py openalex "large language models | 2024 2026 | Computer Science | 5"
+  python main.py crossref "large language models | 2024 2026 | 5 | ./papers"
+  python main.py semantic "large language models | 2024 2026 | 5 | ./papers"
   python main.py scihub "10.1109/ACCESS.2023.3312345"
-  python main.py wiley "fintech prediction | 10"
-  python main.py openalex "fintech prediction | 2025-2026 | Business, Management and Accounting | 5 | D:/md"
-  python main.py semantic "fintech prediction | 2025 2026 | 5 | D:/md"
-  python main.py crossref "fintech prediction | 2025 2026 | 5 | D:/md"
+  python main.py sd "fintech prediction | 2025 2026 | 5 | ./SD_Results"
 """
 
 import sys
@@ -59,22 +65,23 @@ def main():
 
     modules = {
         "sl": "sl",
-        "springer": "sl",
         "cnki": "cnki",
         "ieee": "ieee",
-        "ieee-vpn": "ieee_vpn",
-        "ieeevpn": "ieee_vpn",
         "ebsco": "ebsco",
-        "scihub": "scihub",
-        "sci-hub": "scihub",
+        "wos": "wos",
+        "webofscience": "wos",
         "wiley": "wiley",
+        "scihub": "scihub_dl",
+        "sci-hub": "scihub_dl",
         "openalex": "openalex",
         "oa": "openalex",
+        "crossref": "crossref",
+        "cr": "crossref",
         "semantic": "semantic",
         "semanticscholar": "semantic",
         "ss": "semantic",
-        "crossref": "crossref",
-        "cr": "crossref",
+        "sd": "sciencedirect",
+        "sciencedirect": "sciencedirect",
     }
 
     if source not in modules:

@@ -1,211 +1,216 @@
+"""Wiley Online Library — 搜索 + PDF 下载
+
+通过 Playwright CDP 操作 Wiley Online Library，支持关键词搜索、
+年份筛选、批量下载 PDF（含浏览器内 fetch→base64 管道）。
+
+用法:
+  python main.py wiley "keyword | startYear endYear | count | outputDir"
+
+管道格式:
+  第1段: 关键词
+  第2段: 起止年份 (可选, 如 "2024 2026")
+  第3段: 数量 (默认 5)
+  第4段: 输出目录 (默认 ./Wiley_Results)
 """
-Wiley Online Library — 学术文献检索下载 (Playwright CDP + 浏览器 fetch 管道)
-=======================================================================
-工作流：连接已登录 VPN 的 Chrome → 搜索 → 筛选 (Journals + 时间 + OA)
-→ 逐篇验证OA → pdfdirect 下载 → 失败记录 CSV
 
-返回: (downloaded: int, failed_file: str|None)
-"""
-import asyncio, json, base64, os, re, sys, csv
-from playwright.async_api import async_playwright
+import asyncio
+import json
+import os
+import re
+import sys
+import base64
+import urllib.parse
+
+from utils import sp, log, safe_filename, ensure_output_dir, connect_playwright_async, FailedRecord
 
 
-def run(search_term: str, max_download: int = 5, download_dir: str = r"D:\md",
-        date_filter: str = "Last 12 Months", cdp_port: int = 9222) -> dict:
+DEFAULT_COUNT = 5
+DEFAULT_OUTPUT = "./Wiley_Results"
+
+
+def parse_args(args_text: str) -> dict:
+    """解析 Wiley 参数
+
+    格式: keyword | startYear endYear | count | outputDir
     """
-    入口函数 (同步，供 main.py CLI 调用)
-
-    参数:
-        search_term:  搜索关键词
-        max_download: 最多处理篇数 (含失败)
-        download_dir: PDF 保存目录
-        date_filter:  时间筛选 (Last 12 Months / Last 6 Months / Last 3 Months / Last 2 Years)
-        cdp_port:     Chrome DevTools Protocol 端口
-
-    返回: {"downloaded": int, "failed": int, "failed_file": str|None}
-    """
-    sys.stdout.reconfigure(encoding="utf-8")
-    return asyncio.run(_main(search_term, max_download, download_dir, date_filter, cdp_port))
-
-
-async def _main(search_term: str, max_download: int, download_dir: str,
-                date_filter: str, cdp_port: int) -> dict:
-    p = await async_playwright().start()
-    chrome = await p.chromium.connect_over_cdp(f"http://localhost:{cdp_port}")
-    page = chrome.contexts[0].pages[0]
-
-    failed_file = os.path.join(download_dir, "failed_articles.csv")
-
-    # 1. 导航到 Wiley 首页
-    await page.goto("https://onlinelibrary-wiley-com-443.webvpn.upc.edu.cn/",
-                    wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3000)
-
-    # 2. 搜索
-    search = page.locator("#searchField1")
-    await search.wait_for(timeout=10000)
-    await search.fill(search_term)
-    await page.wait_for_timeout(500)
-    await page.locator(".quick-search__button").click()
-    await page.wait_for_timeout(5000)
-    print(f"[Wiley] 搜索完成: {search_term}")
-
-    # 3. 筛选: Journals + 时间 + Open Access
-    print(f"[Wiley] 筛选: Journals + {date_filter} + Open Access")
-    await page.evaluate('document.getElementById("Journals")?.click()')
-    await page.wait_for_timeout(3000)
-    date_map = {
-        "Last 12 Months": "Last 12 Months",
-        "Last 6 Months":  "Last 6 Months",
-        "Last 3 Months":  "Last 3 Months",
-        "Last 2 Years":   "Last 2 Years",
+    params = {
+        "keyword": "",
+        "start_year": None,
+        "end_year": None,
+        "count": DEFAULT_COUNT,
+        "output_dir": DEFAULT_OUTPUT,
     }
-    date_id = date_map.get(date_filter, "Last 12 Months")
-    await page.evaluate(f'document.getElementById("{date_id}")?.click()')
-    await page.wait_for_timeout(3000)
-    await page.evaluate('document.getElementById("Open Access Content")?.click()')
-    await page.wait_for_timeout(3000)
+    if not args_text or not args_text.strip():
+        return params
 
-    # 4. 获取结果列表 (含期刊信息)
-    results = json.loads(await page.evaluate("""() => {
-        const items = document.querySelectorAll('[class*=search-item], [class*=result-item], li.search__item, .item__body');
-        const seen = new Set();
-        return JSON.stringify(Array.from(items).map(item => {
-            const el = item.querySelector('h3 a, h2 a, .title a');
-            if (!el) return null;
-            const link = el.href;
-            if (seen.has(link)) return null;
-            seen.add(link);
-            const journalEl = item.querySelector('[class*=journal], [class*=source], .meta__item a, [class*=pub]');
-            const journal = journalEl ? journalEl.textContent.trim() : '';
-            return {
-                title: el.textContent.trim().substring(0, 200),
-                link,
-                journal: journal.substring(0, 100)
-            };
-        }).filter(Boolean));
-    }"""))
-    print(f"[Wiley] 搜索结果: {len(results)} 篇 (标记为 OA)")
+    parts = [p.strip() for p in args_text.split("|")]
 
-    # 5. 逐篇处理
-    os.makedirs(download_dir, exist_ok=True)
-    downloaded = []
-    failed = []
+    if len(parts) >= 1 and parts[0]:
+        params["keyword"] = parts[0]
+    if len(parts) >= 2 and parts[1]:
+        years = parts[1].split()
+        if len(years) >= 1 and years[0].isdigit():
+            params["start_year"] = int(years[0])
+        if len(years) >= 2 and years[1].isdigit():
+            params["end_year"] = int(years[1])
+    if len(parts) >= 3 and parts[2] and parts[2].isdigit():
+        params["count"] = int(parts[2])
+    if len(parts) >= 4 and parts[3]:
+        params["output_dir"] = parts[3]
 
-    for i, art in enumerate(results[:max_download], 1):
-        print(f"\n[{i}/{len(results)}] {art['title'][:60]}...")
-        try:
-            await page.goto(art["link"], wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
+    return params
 
-            # 获取文章页元信息 + 验证 OA
-            page_info = json.loads(await page.evaluate("""() => {
-                const title = document.querySelector('meta[name="citation_title"]');
-                const journal = document.querySelector('meta[name="citation_journal_title"]');
-                const authors = document.querySelector('meta[name="citation_author"]');
-                const date = document.querySelector('meta[name="citation_publication_date"]');
-                const doi = document.querySelector('meta[name="citation_doi"]');
-                return JSON.stringify({
-                    title: title ? title.content : '',
-                    journal: journal ? journal.content : '',
-                    author: authors ? authors.content : '',
-                    date: date ? date.content : '',
-                    doi: doi ? doi.content : ''
+
+async def main_async(args_text: str):
+    """异步主入口"""
+    params = parse_args(args_text)
+    keyword = params["keyword"]
+    count = params["count"]
+    output_dir = ensure_output_dir(params["output_dir"])
+
+    if not keyword:
+        log("WILEY", "Keyword required.")
+        return
+
+    log("WILEY", f"Query: {keyword} | Count: {count} | Output: {output_dir}")
+
+    connect_fn = connect_playwright_async()
+    try:
+        p, browser, page = await connect_fn()
+    except Exception as e:
+        log("WILEY", f"Cannot connect to Chrome: {e}")
+        return
+
+    try:
+        # Build search URL
+        search_url = ("https://onlinelibrary.wiley.com/action/doSearch?"
+                      f"ConceptID=&target=default&ContribAuthorRaw=&"
+                      f"startPage=&pageSize={min(count * 2, 50)}&"
+                      f"AllField={urllib.parse.quote(keyword)}&"
+                      "content=articlesSearch&sortBy=relevance")
+        if params["start_year"]:
+            search_url += f"&PubDate={params['start_year']}%20-%20{params['end_year'] or params['start_year']}"
+
+        log("WILEY", f"Searching: {search_url[:120]}...")
+        await page.goto(search_url, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+
+        # Extract articles
+        articles = await page.evaluate("""
+        () => {
+            const results = [];
+            const items = document.querySelectorAll('.search__item, article[data-doi], .item-card');
+            if (items.length === 0) {
+                // Alternative: look for h2/h3 links
+                document.querySelectorAll('h2 a, h3 a, a[href*="/doi/"]').forEach(a => {
+                    const href = a.href || '';
+                    if (href.includes('/doi/') && !results.some(r => r.link === href)) {
+                        results.push({
+                            title: (a.textContent || '').trim(),
+                            link: href,
+                        });
+                    }
                 });
-            }"""))
+            } else {
+                items.forEach(item => {
+                    const titleEl = item.querySelector('a[href*="/doi/"], h2 a, h3 a');
+                    if (!titleEl) return;
+                    const title = (titleEl.textContent || '').trim();
+                    const link = titleEl.href || '';
+                    if (link && title.length > 5 && !results.some(r => r.link === link)) {
+                        results.push({ title: title.substring(0, 150), link });
+                    }
+                });
+            }
+            return results;
+        }
+        """)
 
-            has_oa = await page.evaluate(
-                "() => document.body.innerText.includes('Open Access')")
-            title = page_info["title"] or art["title"]
-            journal = page_info["journal"] or art["journal"]
-            doi = page_info["doi"] or art["link"].split("/doi/")[-1].split("?")[0]
+        if not articles:
+            log("WILEY", "No articles found.")
+            return
 
-            if not has_oa:
-                print("  → 非OA (搜索结果标记不准确)")
-                failed.append({
-                    "title": title,
-                    "journal": journal,
-                    "doi": doi,
-                    "link": art["link"],
-                    "reason": "搜索结果标记为OA但文章页面无Open Access标识"
-                })
-                continue
+        articles = articles[:count]
+        log("WILEY", f"Found {len(articles)} articles:")
+        for i, a in enumerate(articles, 1):
+            sp(f"  {i:2d}. {a['title'][:70]}")
 
-            pdf_url = f"https://onlinelibrary-wiley-com-443.webvpn.upc.edu.cn/doi/pdfdirect/{doi}"
-            pdf_b64 = await page.evaluate("""async (url) => {
-                try {
-                    const resp = await fetch(url);
-                    const ct = resp.headers.get('content-type') || '';
-                    if (ct.includes('text/html')) return 'HTML';
-                    if (!resp.ok) return 'ERR:' + resp.status;
-                    const blob = await resp.blob();
-                    const buf = await blob.arrayBuffer();
-                    const b = new Uint8Array(buf);
-                    let s = '';
-                    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-                    return btoa(s);
-                } catch(e) { return 'ERR:' + e.message; }
-            }""", pdf_url)
+        # Download PDFs
+        log("WILEY", f"Downloading {len(articles)} papers...")
+        failed = FailedRecord()
+        downloaded = 0
 
-            if pdf_b64 == "HTML" or pdf_b64.startswith("ERR:"):
-                print(f"  → OA但PDF不可获取 ({pdf_b64[:50]})")
-                failed.append({
-                    "title": title,
-                    "journal": journal,
-                    "doi": doi,
-                    "link": art["link"],
-                    "reason": f"OA标识但PDF获取失败: {pdf_b64[:50]}"
-                })
-                continue
+        for i, a in enumerate(articles, 1):
+            log("WILEY", f"  [{i}/{len(articles)}] {a['title'][:50]}")
 
-            # 保存 PDF
-            name = re.sub(r"[^\w\s-]", "", title)[:60].strip().replace(" ", "_")
-            fp = os.path.join(download_dir, f"{i}_{name}.pdf")
-            pad = 4 - len(pdf_b64) % 4
-            if pad != 4: pdf_b64 += "=" * pad
-            with open(fp, "wb") as f:
-                f.write(base64.b64decode(pdf_b64))
-            sz = os.path.getsize(fp)
-            print(f"  → OK ({sz//1024} KB)")
-            downloaded.append(fp)
+            try:
+                await page.goto(a["link"], wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(3000)
 
-        except Exception as e:
-            print(f"  → 异常: {e}")
-            failed.append({
-                "title": art["title"],
-                "journal": art["journal"],
-                "doi": "",
-                "link": art["link"],
-                "reason": f"处理异常: {str(e)[:80]}"
-            })
+                pdf_url = await page.evaluate("""
+                () => {
+                    // Try PDF download button
+                    for (const sel of ['a[href*="/doi/pdf"]', 'a[href*="pdf"]',
+                                       'a[class*="pdf"]', 'a[href$=".pdf"]',
+                                       'a[data-test="pdf-link"]', 'a[data-track*="download"]']) {
+                        const el = document.querySelector(sel);
+                        if (el && el.href) return el.href;
+                    }
+                    // Build PDF from DOI
+                    const doiMatch = window.location.href.match(/\\/doi\\/(10\\.[^?#]+)/);
+                    if (doiMatch) return 'https://onlinelibrary.wiley.com/doi/pdf/' + doiMatch[1];
+                    return '';
+                }
+                """)
 
-    # 6. 输出结果
-    print(f"\n{'='*50}")
-    print(f"成功下载: {len(downloaded)} 篇")
-    for f in downloaded:
-        print(f"  {os.path.basename(f)}")
+                if pdf_url:
+                    pdf_b64 = await page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const resp = await fetch('{pdf_url}');
+                            if (!resp.ok) return 'HTTP' + resp.status;
+                            const blob = await resp.blob();
+                            if (blob.size < 1000) return 'SMALL:' + blob.size;
+                            const buf = await blob.arrayBuffer();
+                            const bytes = new Uint8Array(buf);
+                            let bin = '';
+                            for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+                            return 'data:application/pdf;base64,' + btoa(bin);
+                        }} catch(e) {{ return 'ERR:' + e.message; }}
+                    }}
+                    """)
+                    if pdf_b64 and pdf_b64.startswith("data:application/pdf;base64,"):
+                        raw = base64.b64decode(pdf_b64.split(",")[1])
+                        safe = safe_filename(a["title"], 80).replace(" ", "_")
+                        fname = f"{i:02d}_{safe}.pdf"
+                        fpath = os.path.join(output_dir, fname)
+                        with open(fpath, "wb") as f:
+                            f.write(raw)
+                        log("WILEY", f"  [OK] {fname} ({len(raw)//1024} KB)")
+                        downloaded += 1
+                    else:
+                        failed.add(title=a["title"], link=pdf_url, source="Wiley", reason=f"Fetch failed: {str(pdf_b64)[:40]}")
+                else:
+                    failed.add(title=a["title"], link=a["link"], source="Wiley", reason="No PDF link found")
+            except Exception as e:
+                failed.add(title=a["title"], link=a["link"], source="Wiley", reason=str(e)[:60])
+                log("WILEY", f"  Error: {str(e)[:60]}")
 
-    if failed:
-        print(f"\n无法下载: {len(failed)} 篇")
-        with open(failed_file, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=["title", "journal", "doi", "link", "reason"])
-            writer.writeheader()
-            writer.writerows(failed)
-        print(f"失败记录已保存: {failed_file}")
-        for item in failed:
-            print(f"  - {item['title'][:55]} | {item['journal'][:25]} | {item['reason']}")
-    else:
-        print("\n全部OA文章均成功下载!")
+        log("WILEY", f"Done! {downloaded}/{len(articles)} downloaded to {output_dir}")
+        if failed.count > 0:
+            xlsx = failed.save_xlsx(output_dir)
+            log("WILEY", f"Failed records: {xlsx} ({failed.count} papers)")
 
-    print(f"\n目录: {download_dir}")
-    await p.stop()
-    return {"downloaded": len(downloaded), "failed": len(failed),
-            "failed_file": failed_file if failed else None}
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+def main(args_text: str):
+    """同步入口（统一接口）"""
+    asyncio.run(main_async(args_text))
 
 
 if __name__ == "__main__":
-    import sys
-    term = sys.argv[1] if len(sys.argv) > 1 else "fintech prediction"
-    n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    result = run(term, n)
-    print(f"\n结果: {result}")
+    args = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
+    main(args)

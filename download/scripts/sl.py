@@ -14,7 +14,7 @@ import os
 import re
 import urllib.parse
 
-from utils import sp, log, safe_filename, ensure_output_dir, connect_playwright_async
+from utils import sp, log, safe_filename, ensure_output_dir, connect_playwright_async, FailedRecord
 
 
 DEFAULT_SORT = "relevance"
@@ -89,7 +89,7 @@ async def get_oa_articles(page, seen_links):
     return new_articles
 
 
-async def download_pdf(page, art, index, output_dir):
+async def download_pdf(page, art, index, output_dir, failed):
     """浏览器 fetch 管道下载单篇 PDF"""
     log("SL", f"  [{index}] {art['title'][:60]}...")
     await page.goto(art["link"], wait_until="domcontentloaded", timeout=30000)
@@ -106,6 +106,7 @@ async def download_pdf(page, art, index, output_dir):
         return null;
     }""")
     if not pdf_url:
+        failed.add(title=art["title"], link=art["link"], source="SpringerLink", reason="No PDF download link found")
         log("SL", "  -> No PDF link, skip")
         return False
 
@@ -122,6 +123,7 @@ async def download_pdf(page, art, index, output_dir):
         } catch(e) { return 'FETCH_ERROR:' + e.message; }
     }""", pdf_url)
     if pdf_b64.startswith("FETCH_ERROR"):
+        failed.add(title=art["title"], link=pdf_url, source="SpringerLink", reason=f"Fetch failed: {pdf_b64[:60]}")
         log("SL", f"  -> Fetch failed: {pdf_b64[:60]}")
         return False
 
@@ -197,13 +199,17 @@ async def main_async(args_text: str):
 
         # 下载
         log("SL", f"Downloading {min(params['count'], len(all_articles))} papers...")
+        failed = FailedRecord()
         downloaded = 0
         for i, art in enumerate(all_articles[: params["count"]], 1):
-            ok = await download_pdf(page, art, i, output_dir)
+            ok = await download_pdf(page, art, i, output_dir, failed)
             if ok:
                 downloaded += 1
 
         log("SL", f"Done! {downloaded}/{min(params['count'], len(all_articles))} downloaded to {output_dir}")
+        if failed.count > 0:
+            xlsx = failed.save_xlsx(output_dir)
+            log("SL", f"Failed records saved: {xlsx} ({failed.count} papers)")
 
     finally:
         await browser.close()

@@ -1,392 +1,243 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-Crossref Metadata Search — 搜索 + OA PDF 下载
+"""Crossref — API 搜索 + PDF 下载（无需浏览器）
 
-功能：
-  1. 在 search.crossref.org 搜索论文（表单提交）
-  2. 文本解析提取标题/DOI/期刊/年份
-  3. 筛选年份 + 管理学期刊优先级
-  4. 通过 Crossref API + DOI 详情页获取 PDF 下载链接
-  5. expect_download 浏览器下载 → 保存 PDF
-  6. 失败自动记录 Excel
+通过 Crossref REST API 检索文献，支持关键词、年份范围筛选，
+自动查找并下载 OA PDF。
 
-用法：
-  python scripts/main.py crossref "关键词 | 年份范围 | 数量 | 下载目录"
-  python scripts/main.py crossref "fintech prediction | 2025 2026 | 5 | D:/md"
+用法:
+  python main.py crossref "keyword | startYear endYear | count | outputDir"
+  python main.py cr "keyword | startYear endYear | count | outputDir"
 
-参数格式（管道符分隔）：
-  1st: 搜索关键词（必填）
-  2nd: 年份范围 "startYear endYear"（可选，默认 2025 2026）
-  3rd: 下载数量（可选，默认 5）
-  4th: 下载目录（可选，默认 D:/md）
+管道格式:
+  第1段: 关键词
+  第2段: 起止年份 (空格分隔, 如 "2024 2026")
+  第3段: 数量 (默认 5)
+  第4段: 输出目录 (默认 ./Crossref_Results)
 """
 
 import sys
 import os
 import re
 import json
-import time
-import urllib.request
-import urllib.parse
+import requests
+from datetime import datetime
+from urllib.parse import quote
 
-from utils import sp, safe_filename, parse_pipe_args, ensure_output_dir
+from utils import sp, log, safe_filename, ensure_output_dir, validate_pdf, FailedRecord, clean_doi
 
 
-# ── 默认配置 ──────────────────────────────────────────────────────────────
+API_BASE = "https://api.crossref.org/works"
 DEFAULT_COUNT = 5
-DEFAULT_OUTPUT = "D:/md"
+DEFAULT_OUTPUT = "./Crossref_Results"
 
 
-# ── 管理学期刊关键词（UTD24 + ABS 3*+ 英文 + 中文顶刊）────────────────────
-GOOD_VENUE_KEYWORDS = [
-    "management science", "operations research", "manufacturing & service operations",
-    "production and operations management", "journal of operations management",
-    "organization science", "academy of management", "administrative science quarterly",
-    "strategic management journal", "journal of international business studies",
-    "information systems research", "mis quarterly", "journal of management",
-    "decision sciences", "decision support systems", "european journal of operational research",
-    "omega", "computers & operations research", "expert systems with applications",
-    "technological forecasting", "international journal of forecasting", "journal of forecasting",
-    "futures", "annals of operations research",
-    "ieee transactions on engineering management", "research policy",
-    "journal of business research", "technovation",
-    "international journal of production research", "international journal of production economics",
-    "中国管理科学", "管理世界", "系统工程理论与实践", "管理科学学报",
-    "管理工程学报", "管理评论", "管理学报", "科研管理",
-    "科学学研究", "系统工程学报", "系统管理学报", "运筹与管理",
-    "中国软科学", "预测", "管理科学",
-]
+def parse_args(args_text: str) -> dict:
+    """解析 Crossref 参数
 
-
-def is_good_venue(venue_text):
-    """判断是否为目标管理学期刊"""
-    if not venue_text:
-        return False
-    vt = venue_text.lower()
-    return any(v in vt for v in GOOD_VENUE_KEYWORDS)
-
-
-def get_oa_from_crossref_api(doi):
-    """通过 Crossref API 获取 OA/PDF 链接"""
-    if not doi:
-        return ""
-    doi_clean = doi.replace("https://doi.org/", "").replace("http://dx.doi.org/", "").split("?")[0]
-    url = f"https://api.crossref.org/works/{urllib.parse.quote(doi_clean)}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Academic)"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        msg = data.get("message", {})
-
-        for link in msg.get("link", []):
-            ct = link.get("content-type", "")
-            u = link.get("URL", "")
-            if ct == "application/pdf" and u:
-                return u
-            if u and ("pdf" in u.lower() or "/pdf/" in u):
-                return u
-
-        res = msg.get("resource", {})
-        if res.get("primary", {}).get("URL"):
-            return res["primary"]["URL"]
-        return ""
-    except Exception:
-        return ""
-
-
-def search_papers_from_crossref(page, keyword):
-    """在 Crossref search 页搜索论文，返回提取的论文列表"""
-    page.goto("https://search.crossref.org/", wait_until="domcontentloaded", timeout=30000)
-    time.sleep(3)
-
-    page.fill("#search-input", keyword)
-    page.keyboard.press("Enter")
-
-    try:
-        page.wait_for_function('document.body.innerText.includes("results")', timeout=20000)
-    except:
-        pass
-    time.sleep(5)
-
-    text = page.evaluate("document.body.innerText")
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-    papers = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if "doi.org" in line.lower() and "10." in line:
-            doi = line.strip()
-            title = venue = ""
-            year = 0
-
-            for back in range(1, 5):
-                if i - back >= 0:
-                    prev = lines[i - back]
-                    m = re.match(r'([A-Z\s]+)\s+published\s+(\d{4})\s+in\s+(.+)', prev)
-                    if m:
-                        year = int(m.group(2))
-                        venue = m.group(3).strip()
-                    else:
-                        m2 = re.search(r'published\s+.*?(\d{4})\s+in\s+(.+)', prev)
-                        if m2:
-                            year = int(m2.group(1))
-                            venue = m2.group(2).strip()
-
-            for back in range(1, 5):
-                if i - back >= 0:
-                    prev = lines[i - back]
-                    if len(prev) > 15 and not prev.startswith("https") and \
-                       "author" not in prev.lower() and "published" not in prev.lower():
-                        title = prev
-                        break
-
-            papers.append({"title": title or doi, "doi": doi, "venue": venue, "year": year})
-        i += 1
-
-    # 去重
-    seen = set()
-    unique = []
-    for p in papers:
-        key = p["title"].lower()[:40]
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-
-    return unique
-
-
-def get_pdf_url_from_doi(page, doi_clean):
-    """导航到 DOI 页面提取真实 PDF 下载链接"""
-    try:
-        doi_url = f"https://doi.org/{doi_clean}"
-        page.goto(doi_url, wait_until="domcontentloaded", timeout=20000)
-        time.sleep(3)
-
-        pdf_info = page.evaluate("""
-            () => {
-                const url = document.location.href;
-                let pdfLink = '';
-
-                const meta = document.querySelector('meta[name="citation_pdf_url"]');
-                if (meta) pdfLink = meta.getAttribute('content');
-
-                document.querySelectorAll('a[href]').forEach(a => {
-                    const h = a.getAttribute('href') || '';
-                    const t = a.textContent.toLowerCase();
-                    if ((t.includes('download pdf') || t.includes('download full text')) && !pdfLink) {
-                        pdfLink = h.startsWith('http') ? h : new URL(h, url).href;
-                    }
-                    if ((h.includes('.pdf') || h.includes('/pdf/')) && /download|pdf/.test(t) && !pdfLink) {
-                        pdfLink = h.startsWith('http') ? h : new URL(h, url).href;
-                    }
-                });
-
-                document.querySelectorAll('a[href*="/pdf"]').forEach(a => {
-                    if (!pdfLink) {
-                        const h = a.getAttribute('href');
-                        pdfLink = h.startsWith('http') ? h : new URL(h, url).href;
-                    }
-                });
-
-                return { currentUrl: url, pdfLink };
-            }
-        """)
-
-        if pdf_info.get("pdfLink"):
-            pdf_url = pdf_info["pdfLink"]
-            if not pdf_url.startswith("http"):
-                pdf_url = "https:" + pdf_url
-            return pdf_url
-
-        # Fallback: Crossref API
-        return get_oa_from_crossref_api(doi_clean)
-    except Exception:
-        return get_oa_from_crossref_api(doi_clean)
-
-
-def download_pdf(page, pdf_url, fpath):
-    """通过 expect_download 下载 PDF 到指定路径"""
-    with page.expect_download(timeout=20000) as dl_info:
-        page.evaluate(f'window.location.href = "{pdf_url}"')
-
-    download = dl_info.value
-    download.save_as(fpath)
-    return os.path.getsize(fpath)
-
-
-def save_failed_excel(failed, output_dir):
-    """保存失败记录到 Excel"""
-    xlsx_path = os.path.join(output_dir, "failed_crossref.xlsx")
-    try:
-        from openpyxl import Workbook, styles
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "失败记录"
-        headers = ["文章名称", "期刊", "DOI", "链接", "失败原因"]
-        for ci, h in enumerate(headers, 1):
-            ws.cell(row=1, column=ci, value=h).font = styles.Font(bold=True)
-        for ri, f_rec in enumerate(failed, 2):
-            ws.cell(row=ri, column=1, value=f_rec.get("title", ""))
-            ws.cell(row=ri, column=2, value=f_rec.get("venue", ""))
-            ws.cell(row=ri, column=3, value=f_rec.get("doi", ""))
-            ws.cell(row=ri, column=4, value=f_rec.get("link", ""))
-            ws.cell(row=ri, column=5, value=f_rec.get("reason", ""))
-        ws.column_dimensions['A'].width = 50
-        ws.column_dimensions['B'].width = 30
-        ws.column_dimensions['C'].width = 40
-        ws.column_dimensions['D'].width = 50
-        ws.column_dimensions['E'].width = 30
-        wb.save(xlsx_path)
-        sp(f"\n失败记录已保存: {xlsx_path}")
-    except Exception as e:
-        sp(f"  Excel 保存失败: {e}")
-        csv_path = os.path.join(output_dir, "failed_crossref.csv")
-        with open(csv_path, "w", encoding="utf-8-sig") as f:
-            f.write("文章名称,期刊,DOI,链接,失败原因\n")
-            for f_rec in failed:
-                f.write(f"{f_rec.get('title','')},{f_rec.get('venue','')},{f_rec.get('doi','')},{f_rec.get('link','')},{f_rec.get('reason','')}\n")
-        sp(f"  CSV 已保存: {csv_path}")
-
-
-def main(args_text=""):
-    # ── 解析参数 ──────────────────────────────────────────────────────────
-    defaults = {
-        "keyword": "fintech prediction",
-        "start_year": 2025,
-        "end_year": 2026,
+    格式: keyword | startYear endYear | count | outputDir
+    注意: 第3段是 count，第4段是 outputDir（与测试报告一致的规范格式）
+    """
+    params = {
+        "keyword": "",
+        "start_year": None,
+        "end_year": None,
         "count": DEFAULT_COUNT,
         "output_dir": DEFAULT_OUTPUT,
     }
-    params = parse_pipe_args(args_text, defaults)
+    if not args_text or not args_text.strip():
+        return params
 
-    keyword = params.get("keyword", defaults["keyword"])
-    start_year = params.get("start_year", defaults["start_year"])
-    end_year = params.get("end_year", defaults["end_year"])
-    count = params.get("count", defaults["count"])
-    output_dir = params.get("output_dir", defaults["output_dir"])
+    parts = [p.strip() for p in args_text.split("|")]
 
-    sp("=" * 60)
-    sp("Crossref Metadata Search 搜索下载")
-    sp("=" * 60)
-    sp(f"  关键词: {keyword}")
-    sp(f"  年份: {start_year}-{end_year}")
-    sp(f"  目标数量: {count}")
-    sp(f"  下载目录: {output_dir}")
+    if len(parts) >= 1 and parts[0]:
+        params["keyword"] = parts[0]
+    if len(parts) >= 2 and parts[1]:
+        years = parts[1].split()
+        if len(years) >= 1 and years[0].isdigit():
+            params["start_year"] = int(years[0])
+        if len(years) >= 2 and years[1].isdigit():
+            params["end_year"] = int(years[1])
+    if len(parts) >= 3 and parts[2] and parts[2].isdigit():
+        params["count"] = int(parts[2])
+    if len(parts) >= 4 and parts[3]:
+        params["output_dir"] = parts[3]
 
-    # ── 1. 连接 Chrome ──────────────────────────────────────────────────
-    sp("\n[1/5] 连接 Chrome CDP...")
-    from playwright.sync_api import sync_playwright
+    return params
 
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.connect_over_cdp("http://localhost:9222")
-    ctx = browser.contexts[0]
-    page = ctx.new_page()
-    sp("  页面已创建")
 
-    # ── 2. 搜索 + 提取 ──────────────────────────────────────────────────
-    sp("\n[2/5] 搜索论文...")
-    papers = search_papers_from_crossref(page, keyword)
-    sp(f"  提取到 {len(papers)} 篇论文")
-    for p in papers[:10]:
-        sp(f"    [{p.get('year','')}] {p['title'][:60]}  {p.get('venue','')[:40]}")
+def search_works(params):
+    """通过 Crossref API 搜索文献"""
+    filters = []
+    if params["start_year"]:
+        filters.append(f"from-pub-date:{params['start_year']}-01-01")
+    if params["end_year"]:
+        filters.append(f"until-pub-date:{params['end_year']}-12-31")
 
-    # ── 3. 筛选年份 + 期刊排序 ──────────────────────────────────────────
-    sp("\n[3/5] 筛选条件...")
-    filtered = [p for p in papers if p.get("year") and start_year <= p["year"] <= end_year]
-    good = [p for p in filtered if is_good_venue(p.get("venue", ""))]
-    other = [p for p in filtered if not is_good_venue(p.get("venue", ""))]
-    ordered = good + other
-    sp(f"  年份 {start_year}-{end_year} 筛选后: {len(filtered)} 篇")
-    sp(f"  管理学期刊: {len(good)} 篇")
+    query_params = {
+        "query": params["keyword"],
+        "rows": min(params["count"] * 3, 50),
+        "sort": "relevance",
+        "order": "desc",
+    }
+    if filters:
+        query_params["filter"] = ",".join(filters)
 
-    # ── 4. 获取 OA PDF 链接 ─────────────────────────────────────────────
-    sp("\n[4/5] 获取 OA 链接...")
+    log("CROSSREF", f"Query: {params['keyword']}")
+    log("CROSSREF", f"Year: {params['start_year']}-{params['end_year']}")
+    log("CROSSREF", f"Target count: {params['count']}")
 
-    oa_papers = []
-    for paper in ordered[:15]:
-        doi = paper.get("doi", "")
-        if not doi:
-            continue
-        doi_clean = doi.replace("https://doi.org/", "").replace("http://dx.doi.org/", "").split("?")[0]
-        paper["doi_clean"] = doi_clean
-        sp(f"  [{paper['title'][:45]}] ...")
+    try:
+        resp = requests.get(API_BASE, params=query_params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("message", {}).get("items", [])
+        log("CROSSREF", f"Fetched {len(items)} works")
 
-        # 先访问 DOI 页找真实 PDF 链接
-        pdf_url = get_pdf_url_from_doi(page, doi_clean)
-        if pdf_url:
-            paper["pdf_url"] = pdf_url
-            oa_papers.append(paper)
-            sp(f"    PDF: {pdf_url[:70]}...")
-        else:
-            sp(f"    无可用 PDF 链接")
+        papers = []
+        for r in items:
+            doi = r.get("DOI", "")
+            title = (r.get("title") or [""])[0]
+            year = (r.get("published-print") or r.get("published-online") or r.get("created") or {}).get("date-parts", [[None]])[0][0]
+            authors = [a.get("family", "") for a in (r.get("author") or []) if a.get("family")]
+            # Check OA status
+            is_oa = r.get("is-referenced-by-count", 0) > 0
 
-    sp(f"  共获取到 {len(oa_papers)} 篇可下载论文")
+            # Try to find PDF URL from link field
+            pdf_url = ""
+            for link in r.get("link") or []:
+                if link.get("content-type") in ("application/pdf", "unspecified") and link.get("URL"):
+                    pdf_url = link["URL"]
+                    break
 
-    # ── 5. 下载 ─────────────────────────────────────────────────────────
-    sp("\n[5/5] 下载 PDF...")
-    ensure_output_dir(output_dir)
+            papers.append({
+                "title": title,
+                "doi": doi,
+                "year": year,
+                "authors": ", ".join(authors[:5]),
+                "cited": r.get("is-referenced-by-count", 0),
+                "pdf_url": pdf_url,
+            })
 
-    downloaded = []
-    failed = []
-    processed = 0
+        # Year filtering (API may not filter precisely)
+        if params["start_year"] and params["end_year"]:
+            filtered = [p for p in papers if p["year"] and params["start_year"] <= p["year"] <= params["end_year"]]
+            log("CROSSREF", f"After year filter: {len(filtered)} papers")
+            return filtered[:params["count"]]
 
-    for paper in oa_papers:
-        if processed >= count:
-            break
+        return papers[:params["count"]]
+    except Exception as e:
+        log("CROSSREF", f"API error: {e}")
+        return []
 
-        title = paper["title"]
-        pdf_url = paper.get("pdf_url", "")
-        sp(f"\n  --- {processed+1}/{count}: {title[:50]}...")
 
-        if not pdf_url:
-            failed.append({"title": title, "venue": paper.get("venue", ""),
-                           "doi": paper.get("doi", ""), "link": "",
-                           "reason": "未找到 PDF 链接"})
-            continue
+def find_oa_pdf(doi, title):
+    """尝试从多个来源获取 OA PDF"""
+    # Unpaywall API (uses email as required param)
+    try:
+        email = "research@example.com"
+        url = f"https://api.unpaywall.org/v2/{doi}?email={email}"
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            oa_loc = data.get("best_oa_location", {}) or {}
+            if oa_loc.get("pdf_url"):
+                return oa_loc["pdf_url"]
+            if oa_loc.get("url_for_pdf"):
+                return oa_loc["url_for_pdf"]
+    except Exception:
+        pass
 
-        if not pdf_url.startswith("http"):
-            pdf_url = "https:" + pdf_url
+    # Direct publisher PDF URL pattern
+    if doi:
+        return f"https://doi.org/{doi}"
 
-        sp(f"  PDF: {pdf_url[:80]}...")
-        fname = safe_filename(title, 60) + ".pdf"
+    return ""
+
+
+def download_pdf(pdf_url, title, doi, index, output_dir):
+    """下载单篇 PDF"""
+    if not pdf_url:
+        return None
+
+    try:
+        resp = requests.get(pdf_url, timeout=60,
+                            headers={"User-Agent": "Mozilla/5.0"},
+                            allow_redirects=True)
+        if resp.status_code != 200:
+            log("CROSSREF", f"  HTTP {resp.status_code}")
+            return None
+
+        safe = safe_filename(title, 80).replace(" ", "_") or f"paper_{index}"
+        fname = f"{index:02d}_{safe}.pdf"
         fpath = os.path.join(output_dir, fname)
 
-        # 独立页面下载，避免页面状态干扰
-        dl_page = ctx.new_page()
-        try:
-            size = download_pdf(dl_page, pdf_url, fpath)
-            sp(f"  [OK] -> {fname} ({size} bytes)")
-            downloaded.append({"title": title, "file": fname})
-            processed += 1
-        except Exception as e:
-            sp(f"  [FAIL] {e}")
-            failed.append({"title": title, "venue": paper.get("venue", ""),
-                           "doi": paper.get("doi", ""), "link": pdf_url,
-                           "reason": str(e)[:100]})
-        finally:
-            dl_page.close()
-            time.sleep(1)
+        with open(fpath, "wb") as f:
+            f.write(resp.content)
 
-    # ── 结果汇总 ─────────────────────────────────────────────────────────
-    sp("\n" + "=" * 60)
-    sp("结果汇总")
-    sp("=" * 60)
-    sp(f"下载成功: {len(downloaded)} 篇")
-    for d in downloaded:
-        sp(f"  [OK] {d['title'][:60]}")
+        ok, msg = validate_pdf(fpath)
+        if ok:
+            log("CROSSREF", f"  [OK] {fname} ({len(resp.content)//1024} KB)")
+            return fpath
+        else:
+            os.remove(fpath)
+            log("CROSSREF", f"  {msg}")
+            return None
+    except Exception as e:
+        log("CROSSREF", f"  error: {e}")
+        return None
 
-    sp(f"\n下载失败: {len(failed)} 篇")
-    for f_rec in failed:
-        sp(f"  [FAIL] {f_rec['title'][:60]}")
-        sp(f"         原因: {f_rec.get('reason', '')[:60]}")
 
-    if failed:
-        save_failed_excel(failed, output_dir)
+def main(args_text: str):
+    """主流程"""
+    params = parse_args(args_text)
 
-    playwright.stop()
-    sp("\n完成!")
+    if not params["keyword"]:
+        log("CROSSREF", "Keyword required.")
+        sp("Usage: python main.py crossref \"keyword | startYear endYear | count | outputDir\"")
+        return
+
+    output_dir = ensure_output_dir(params["output_dir"])
+    log("CROSSREF", f"Target count: {params['count']} | Output: {output_dir}")
+
+    papers = search_works(params)
+
+    if not papers:
+        log("CROSSREF", "No papers found.")
+        return
+
+    log("CROSSREF", f"\nResults ({len(papers)} papers):")
+    for i, p in enumerate(papers, 1):
+        sp(f"  {i:2d}. [{p.get('year','?')}] {p['title'][:70]}")
+        if p.get("doi"):
+            sp(f"      DOI: {p['doi']}")
+
+    # Save metadata
+    meta_path = os.path.join(output_dir, "papers_list.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(papers, f, ensure_ascii=False, indent=2)
+    log("CROSSREF", f"List saved: {meta_path}")
+
+    # Try to find and download PDFs
+    failed = FailedRecord()
+    downloaded = 0
+    for i, p in enumerate(papers, 1):
+        log("CROSSREF", f"  [{i}/{len(papers)}] {p['title'][:50]}")
+        pdf_url = p.get("pdf_url", "") or find_oa_pdf(p.get("doi", ""), p.get("title", ""))
+        if not pdf_url and p.get("doi"):
+            pdf_url = f"https://doi.org/{p['doi']}"
+
+        if pdf_url:
+            result = download_pdf(pdf_url, p["title"], p.get("doi", ""), i, output_dir)
+            if result:
+                downloaded += 1
+            else:
+                failed.add(title=p["title"], doi=p.get("doi", ""), link=pdf_url, source="Crossref", reason="Download failed")
+        else:
+            failed.add(title=p["title"], doi=p.get("doi", ""), source="Crossref", reason="No PDF URL found")
+
+    log("CROSSREF", f"Done! {downloaded}/{len(papers)} PDFs downloaded to {output_dir}")
+    if failed.count > 0:
+        xlsx = failed.save_xlsx(output_dir)
+        log("CROSSREF", f"Failed records: {xlsx} ({failed.count} papers)")
 
 
 if __name__ == "__main__":

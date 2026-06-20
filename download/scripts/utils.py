@@ -1,6 +1,6 @@
 """download — 学术文献批量检索下载工具集
 
-共享工具函数：Chrome连接、参数解析、文件操作、控制台输出
+共享工具函数：Chrome连接、参数解析、文件操作、控制台输出、失败记录导出Excel
 """
 
 import sys
@@ -9,6 +9,45 @@ import re
 import json
 import time
 import urllib.parse
+import csv
+
+
+# ── 环境配置 ────────────────────────────────────────────────────────────────
+def load_env():
+    """加载 .env 文件（如果有），返回配置字典"""
+    config = {
+        "VPN_DOMAIN": os.environ.get("VPN_DOMAIN", ""),
+    }
+    # 尝试从 .env 文件加载
+    env_paths = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        ".env",
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, _, val = line.partition("=")
+                        key, val = key.strip(), val.strip().strip("\"'")
+                        if key == "VPN_DOMAIN" and val:
+                            config["VPN_DOMAIN"] = val
+            except Exception:
+                pass
+            break
+    return config
+
+
+_env_config = load_env()
+
+
+def get_vpn_domain(default=""):
+    """获取 VPN 域名，优先从环境变量/.env 读取"""
+    return _env_config.get("VPN_DOMAIN") or default
 
 
 # ── 控制台输出 ────────────────────────────────────────────────────────────
@@ -74,6 +113,47 @@ def extract_year(date_str: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def validate_pdf(path, min_bytes=1024):
+    """校验文件是否为有效 PDF
+
+    Args:
+        path: 文件路径
+        min_bytes: 最小字节数（默认 1KB）
+
+    Returns:
+        (True, "") 或 (False, 原因)
+    """
+    if not os.path.exists(path):
+        return False, "file not found"
+    size = os.path.getsize(path)
+    if size < min_bytes:
+        return False, f"file too small ({size} bytes < {min_bytes})"
+    if size == 0:
+        return False, "file is empty (0 bytes)"
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+        if header != b"%PDF":
+            return False, f"not a PDF (header: {header.hex()})"
+    except Exception as e:
+        return False, f"read error: {e}"
+    return True, ""
+
+
+def clean_doi(raw_url):
+    """从 URL 或文本中提取纯 DOI
+
+    >>> clean_doi("https://doi.org/10.1109/ACCESS.2023.3312345")
+    '10.1109/ACCESS.2023.3312345'
+    >>> clean_doi("10.1234/abc.2023.001")
+    '10.1234/abc.2023.001'
+    """
+    if not raw_url:
+        return ""
+    m = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9a-z]+)", raw_url)
+    return m.group(1) if m else raw_url.strip()
+
+
 def save_json(data, filepath):
     """保存 JSON 文件"""
     os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -106,12 +186,68 @@ def ensure_output_dir(path):
     return path
 
 
+# ── 下载失败记录 + 导出 Excel ──────────────────────────────────────────────
+
+class FailedRecord:
+    """记录下载失败的论文信息，支持最后汇总导出 Excel/CSV"""
+
+    def __init__(self):
+        self.records = []  # [{title, doi, link, source, reason}, ...]
+
+    def add(self, title="", doi="", link="", source="", reason=""):
+        self.records.append({
+            "title": title,
+            "doi": doi,
+            "link": link,
+            "source": source,
+            "reason": reason,
+        })
+
+    @property
+    def count(self):
+        return len(self.records)
+
+    def save_xlsx(self, output_dir, filename="失败记录.xlsx"):
+        """导出为 Excel (.xlsx)，回退到 .csv"""
+        if not self.records:
+            return None
+
+        filepath = os.path.join(output_dir, filename)
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "失败记录"
+            # 表头
+            headers = ["序号", "论文标题", "DOI", "链接", "来源", "失败原因"]
+            ws.append(headers)
+            for i, r in enumerate(self.records, 1):
+                ws.append([i, r["title"], r["doi"], r["link"], r["source"], r["reason"]])
+            # 调整列宽
+            for col in ws.columns:
+                max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+            wb.save(filepath)
+            return filepath
+        except ImportError:
+            # 无 openpyxl，回退到 CSV
+            csv_path = filepath.replace(".xlsx", ".csv")
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["序号", "论文标题", "DOI", "链接", "来源", "失败原因"])
+                for i, r in enumerate(self.records, 1):
+                    writer.writerow([i, r["title"], r["doi"], r["link"], r["source"], r["reason"]])
+            return csv_path
+
+
 # ── Chrome CDP 连接 (Playwright) ──────────────────────────────────────────
 
 def connect_playwright(port=9222):
     """连接到已打开的 Chrome，返回 (playwright, browser, context, page)
 
-    使用 Playwright sync_api，适用于 cnki, springer 等同步操作场景
+    使用 Playwright sync_api，适用于 cnki 等同步操作场景
     """
     from playwright.sync_api import sync_playwright
 

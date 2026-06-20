@@ -15,12 +15,12 @@ import re
 import json
 import urllib.parse
 
-from utils import sp, log, safe_filename, ensure_output_dir
+from utils import sp, log, safe_filename, ensure_output_dir, FailedRecord, get_vpn_domain
 
 
 DEFAULT_COUNT = 20
 DEFAULT_OUTPUT = "./CNKI_Results"
-CNKI_VPN_DOMAIN = "kns-cnki-net-443.webvpn.upc.edu.cn"
+CNKI_VPN_DOMAIN = get_vpn_domain("kns-cnki-net-443.webvpn.upc.edu.cn")
 
 
 def parse_args(args_text: str) -> dict:
@@ -192,7 +192,7 @@ def get_articles(page, count):
     return articles
 
 
-def download_articles(context, articles, count, output_dir):
+def download_articles(context, articles, count, output_dir, failed):
     """批量下载文献"""
     actual = min(count, len(articles))
     log("CNKI", f"Downloading {actual} papers to {output_dir}")
@@ -209,7 +209,7 @@ def download_articles(context, articles, count, output_dir):
         except Exception:
             pass
 
-    success, failed = 0, 0
+    success, fail_count = 0, 0
     for idx in range(actual):
         art = articles[idx]
         title = art["title"]
@@ -241,18 +241,20 @@ def download_articles(context, articles, count, output_dir):
                 log("CNKI", "  ⚠ CAJ download triggered")
                 success += 1
             else:
+                failed.add(title=title, link=href, source="CNKI", reason="No PDF/CAJ download button on detail page")
                 log("CNKI", "  ✗ No PDF/CAJ button found")
-                failed += 1
+                fail_count += 1
 
             time.sleep(5)
             tab.close()
             time.sleep(1)
         except Exception as e:
+            failed.add(title=title, link=href, source="CNKI", reason=str(e)[:60])
             log("CNKI", f"  ✗ Error: {str(e)[:60]}")
-            failed += 1
+            fail_count += 1
 
-    log("CNKI", f"Done: {success} success, {failed} failed")
-    return success, failed
+    log("CNKI", f"Done: {success} success, {fail_count} failed")
+    return success, fail_count
 
 
 def main(args_text: str):
@@ -298,7 +300,11 @@ def main(args_text: str):
             log("CNKI", "Cancelled")
             return
 
-        download_articles(context, articles, params["count"], output_dir)
+        failed_rec = FailedRecord()
+        download_articles(context, articles, params["count"], output_dir, failed_rec)
+        if failed_rec.count > 0:
+            xlsx = failed_rec.save_xlsx(output_dir)
+            log("CNKI", f"Failed records saved: {xlsx} ({failed_rec.count} papers)")
 
     finally:
         browser.close()

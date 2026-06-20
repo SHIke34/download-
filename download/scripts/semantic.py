@@ -1,401 +1,233 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-Semantic Scholar — 搜索 + OA筛选 + 批量下载
+"""Semantic Scholar — 浏览器搜索 + PDF 下载
 
-功能：
-  1. 通过浏览器导航到 Semantic Scholar 搜索论文
-  2. URL参数筛选年份 + 页面点击 OA 筛选
-  3. 逐篇检查详情页 → 提取 PDF 链接
-  4. 浏览器内 fetch → base64 → Python 解码保存 PDF
-  5. 优先管理学期刊（UTD24 / ABS 3*+ / 中文顶刊）
-  6. 失败自动记录 Excel
+通过 Playwright CDP 操作 Semantic Scholar 网站，支持关键词搜索、
+年份筛选、批量批量下载 PDF。
 
-用法：
-  python scripts/main.py semantic "关键词 | 年份范围 | 数量 | 下载目录"
-  python scripts/main.py semantic "fintech prediction | 2025 2026 | 5 | D:/md"
+用法:
+  python main.py semantic "keyword | startYear endYear | count | outputDir"
+  python main.py ss "keyword | startYear endYear | count | outputDir"
 
-参数格式（管道符分隔）：
-  1st: 搜索关键词（必填）
-  2nd: 年份范围 "startYear endYear"（可选，默认 2025 2026）
-  3rd: 下载数量（可选，默认 5）
-  4th: 下载目录（可选，默认 D:/md）
+管道格式:
+  第1段: 关键词
+  第2段: 起止年份 (空格分隔, 如 "2024 2026")
+  第3段: 数量 (默认 5)
+  第4段: 输出目录 (默认 ./Semantic_Results)
 """
 
-import sys
+import asyncio
 import os
 import re
 import json
-import time
+import sys
 import base64
 import urllib.parse
 
-from utils import sp, safe_filename, parse_pipe_args, ensure_output_dir
+from utils import sp, log, safe_filename, ensure_output_dir, connect_playwright_async, FailedRecord
 
 
-# ── 默认配置 ──────────────────────────────────────────────────────────────
 DEFAULT_COUNT = 5
-DEFAULT_OUTPUT = "D:/md"
-
-# ── 管理学期刊关键词（UTD24 + ABS 3*+ 英文 + 中文顶刊）────────────────────
-GOOD_VENUE_KEYWORDS = [
-    "management science", "operations research", "manufacturing & service operations",
-    "production and operations management", "journal of operations management",
-    "organization science", "academy of management", "administrative science quarterly",
-    "strategic management journal", "journal of international business studies",
-    "information systems research", "mis quarterly", "journal of management",
-    "decision sciences", "decision support systems", "european journal of operational research",
-    "omega", "computers & operations research", "expert systems with applications",
-    "technological forecasting", "international journal of forecasting", "journal of forecasting",
-    "futures", "annals of operations research",
-    "ieee transactions on engineering management", "research policy",
-    "journal of business research", "technovation",
-    "international journal of production research", "international journal of production economics",
-    "中国管理科学", "管理世界", "系统工程理论与实践", "管理科学学报",
-    "管理工程学报", "管理评论", "管理学报", "科研管理",
-    "科学学研究", "系统工程学报", "系统管理学报", "运筹与管理",
-    "中国软科学", "预测", "管理科学",
-]
+DEFAULT_OUTPUT = "./Semantic_Results"
 
 
-def is_good_venue(venue_text):
-    """判断是否为目标管理学期刊"""
-    if not venue_text:
-        return False
-    vt = venue_text.lower()
-    return any(v in vt for v in GOOD_VENUE_KEYWORDS)
+def parse_args(args_text: str) -> dict:
+    """解析 Semantic Scholar 参数
 
-
-def wait_for_render(page, timeout=20000):
-    """等待 Semantic Scholar React 页面渲染完成"""
-    try:
-        page.wait_for_function(
-            "document.querySelectorAll('a[href*=\"/paper/\"]').length > 3",
-            timeout=timeout
-        )
-        return True
-    except:
-        return False
-
-
-def main(args_text=""):
-    # ── 解析参数 ──────────────────────────────────────────────────────────
-    defaults = {
-        "keyword": "fintech prediction",
-        "start_year": 2025,
-        "end_year": 2026,
+    格式: keyword | startYear endYear | count | outputDir
+    """
+    params = {
+        "keyword": "",
+        "start_year": None,
+        "end_year": None,
         "count": DEFAULT_COUNT,
         "output_dir": DEFAULT_OUTPUT,
     }
-    params = parse_pipe_args(args_text, defaults)
+    if not args_text or not args_text.strip():
+        return params
 
-    keyword = params.get("keyword", defaults["keyword"])
-    start_year = params.get("start_year", defaults["start_year"])
-    end_year = params.get("end_year", defaults["end_year"])
-    count = params.get("count", defaults["count"])
-    output_dir = params.get("output_dir", defaults["output_dir"])
+    parts = [p.strip() for p in args_text.split("|")]
 
-    sp("=" * 60)
-    sp("Semantic Scholar 搜索下载")
-    sp("=" * 60)
-    sp(f"  关键词: {keyword}")
-    sp(f"  年份: {start_year}-{end_year}")
-    sp(f"  目标数量: {count}")
-    sp(f"  下载目录: {output_dir}")
+    if len(parts) >= 1 and parts[0]:
+        params["keyword"] = parts[0]
+    if len(parts) >= 2 and parts[1]:
+        years = parts[1].split()
+        if len(years) >= 1 and years[0].isdigit():
+            params["start_year"] = int(years[0])
+        if len(years) >= 2 and years[1].isdigit():
+            params["end_year"] = int(years[1])
+    if len(parts) >= 3 and parts[2] and parts[2].isdigit():
+        params["count"] = int(parts[2])
+    if len(parts) >= 4 and parts[3]:
+        params["output_dir"] = parts[3]
 
-    # ── 1. 连接 Chrome CDP ────────────────────────────────────────────────
-    sp("\n[1/5] 连接 Chrome CDP...")
-    from playwright.sync_api import sync_playwright
+    return params
 
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.connect_over_cdp("http://localhost:9222")
-    ctx = browser.contexts[0]
-    page = ctx.new_page()
-    sp("  页面已创建")
 
-    # ── 2. 搜索 ────────────────────────────────────────────────────────────
-    sp("\n[2/5] 搜索论文...")
-    query = urllib.parse.quote(keyword)
-    url = f"https://www.semanticscholar.org/search?q={query}&sort=relevance"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    time.sleep(5)
+async def main_async(args_text: str):
+    """异步主入口"""
+    params = parse_args(args_text)
+    keyword = params["keyword"]
+    count = params["count"]
+    output_dir = ensure_output_dir(params["output_dir"])
 
-    if wait_for_render(page):
-        sp("  搜索结果已渲染")
-    else:
-        sp("  等待渲染超时，继续...")
-    sp(f"  页面标题: {page.title()}")
+    if not keyword:
+        log("SEMANTIC", "Keyword required.")
+        return
 
-    # ── 3. 筛选条件 ──────────────────────────────────────────────────────
-    sp("\n[3/5] 应用筛选条件...")
+    log("SEMANTIC", f"Query: {keyword} | Count: {count} | Output: {output_dir}")
 
-    # 3a. 年份筛选 — 直接改URL
-    sp(f"  年份筛选 {start_year}-{end_year}...")
-    years_param = "".join(f"&year%5B%5D={y}" for y in range(start_year, end_year + 1))
-    filter_url = f"https://www.semanticscholar.org/search?q={query}&sort=relevance{years_param}"
-    page.goto(filter_url, wait_until="domcontentloaded", timeout=60000)
-    time.sleep(5)
-    wait_for_render(page)
-
-    # 3b. OA 筛选 — 尝试点击页面上的 Open Access 筛选器
-    sp("  OA筛选...")
+    connect_fn = connect_playwright_async()
+    log("SEMANTIC", "Connecting to Chrome...")
     try:
-        oa_selectors = [
-            "label:has-text('Open Access')",
-            "span:has-text('Open Access')",
-            "div:has-text('Open Access')",
-            "text=Open Access",
-        ]
-        clicked = False
-        for sel in oa_selectors:
-            try:
-                el = page.locator(sel).first
-                if el.is_visible(timeout=3000):
-                    el.click()
-                    sp("    已点击 Open Access")
-                    time.sleep(3)
-                    clicked = True
-                    break
-            except:
-                continue
-        if not clicked:
-            sp("    Open Access 筛选按钮不可见，继续全部预览")
+        p, browser, page = await connect_fn()
     except Exception as e:
-        sp(f"    OA 点击异常: {e}")
+        log("SEMANTIC", f"ERROR: Cannot connect to Chrome: {e}")
+        log("SEMANTIC", "Ensure Chrome is running with --remote-debugging-port=9222")
+        return
+    log("SEMANTIC", "Connected.")
 
-    time.sleep(3)
+    try:
+        # Search
+        search_url = f"https://www.semanticscholar.org/search?q={urllib.parse.quote(keyword)}&sort=relevance"
+        if params["start_year"]:
+            search_url += f"&year%5B0%5D={params['start_year']}&year%5B1%5D={params['end_year'] or params['start_year']}"
 
-    # ── 4. 提取论文列表 ──────────────────────────────────────────────────
-    sp("\n[4/5] 提取论文...")
+        log("SEMANTIC", f"Searching: {search_url}")
+        await page.goto(search_url, wait_until="networkidle", timeout=45000)
+        await page.wait_for_timeout(5000)
 
-    # 滚动加载更多
-    for i in range(5):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1.5)
+        # Check for Open Access filter
+        try:
+            # Try to click "Open Access" filter
+            oa_btn = page.locator('[data-test-id="filter-open-access"], button:has-text("Open Access")')
+            if await oa_btn.count() > 0:
+                await oa_btn.first.click()
+                log("SEMANTIC", "Open Access filter clicked")
+                await page.wait_for_timeout(3000)
+        except Exception as e:
+            log("SEMANTIC", f"OA filter click failed (non-fatal): {e}")
 
-    # 从页面提取论文链接
-    papers = page.evaluate("""
+        # Extract papers
+        papers = await page.evaluate("""
         () => {
-            const links = document.querySelectorAll('a[href*="/paper/"]');
-            const seen = new Set();
             const results = [];
-
-            links.forEach(a => {
-                const href = a.getAttribute('href');
-                const title = (a.textContent || '').trim();
-
-                if (!href || !title || title.length < 15 || seen.has(href)) return;
-                seen.add(href);
-
-                let parent = a.closest('[class*="result"], [class*="paper"], li, article') || a.parentElement;
-
-                let venue = '';
-                const venueEl = parent ? parent.querySelector('[class*="venue"], [class*="journal"]') : null;
-                if (venueEl) venue = venueEl.textContent.trim();
-
-                results.push({
-                    title: title,
-                    href: href.startsWith('http') ? href : 'https://www.semanticscholar.org' + href,
-                    venue: venue,
-                });
+            const items = document.querySelectorAll('[data-test-id="search-result"], [data-test-id="result-item"], .cl-paper-row');
+            items.forEach(item => {
+                const titleEl = item.querySelector('a[data-test-id="title-link"], h2 a, a[href*="/paper/"]');
+                if (!titleEl) return;
+                const title = (titleEl.textContent || '').trim();
+                const link = titleEl.href || '';
+                const yearEl = item.querySelector('[data-test-id="year"], .paper-year');
+                const year = yearEl ? (yearEl.textContent || '').trim() : '';
+                const authorsEl = item.querySelector('[data-test-id="authors"], .author-list');
+                const authors = authorsEl ? (authorsEl.textContent || '').trim() : '';
+                results.push({ title: title.substring(0, 150), link, year, authors: authors.substring(0, 120) });
             });
-
             return results;
         }
-    """)
-
-    sp(f"  提取到 {len(papers)} 篇论文")
-    for i, p in enumerate(papers[:10]):
-        sp(f"    {i+1}. {p['title'][:60]}")
-        if p.get('venue'):
-            sp(f"       来源: {p['venue'][:40]}")
-
-    # ── 逐篇检查 OA 状态 ──────────────────────────────────────────────────
-    sp("\n  检查 OA 状态...")
-    oa_papers = []
-    for paper in papers[:30]:
-        try:
-            page.goto(paper['href'], wait_until="domcontentloaded", timeout=20000)
-            time.sleep(2)
-        except:
-            continue
-
-        info = page.evaluate("""
-            () => {
-                const body = (document.body.textContent || '').toLowerCase();
-                const isOA = body.includes('open access') || body.includes('open-access');
-
-                let venue = '';
-                const metaEls = document.querySelectorAll('[class*="venue"], [class*="source"], [data-test-id="venue"]');
-                metaEls.forEach(el => { if (el.textContent.trim()) venue = el.textContent.trim(); });
-
-                const pdfUrls = [];
-                document.querySelectorAll('a[href]').forEach(a => {
-                    const h = a.getAttribute('href') || '';
-                    const t = a.textContent.toLowerCase();
-                    if (h.includes('.pdf') || t.includes('pdf') || t.includes('download fulltext')) {
-                        pdfUrls.push(h.startsWith('http') ? h : 'https://www.semanticscholar.org' + h);
-                    }
-                });
-
-                let doi = '';
-                document.querySelectorAll('a[href*="doi.org"]').forEach(a => {
-                    doi = a.getAttribute('href') || doi;
-                });
-
-                let oaPdfUrl = '';
-                const meta = document.querySelector('meta[name="citation_pdf_url"]');
-                if (meta) oaPdfUrl = meta.getAttribute('content');
-
-                return { isOA, venue, pdfUrls, doi, oaPdfUrl };
-            }
         """)
 
-        paper['isOA'] = info.get('isOA', False)
-        paper['venue'] = info.get('venue', '') or paper.get('venue', '')
-        paper['pdfUrls'] = info.get('pdfUrls', [])
-        paper['doi'] = info.get('doi', '')
-        paper['oaPdfUrl'] = info.get('oaPdfUrl', '')
+        if not papers:
+            log("SEMANTIC", "No papers found. The page structure may have changed.")
+            try:
+                debug_html = await page.content()
+                debug_path = os.path.join(output_dir, "semantic_debug.html")
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(debug_html[:200000])
+                log("SEMANTIC", f"Saved debug HTML: {debug_path}")
+            except Exception:
+                pass
+            return
 
-        sp(f"    [{paper['title'][:50]}] OA={paper['isOA']} PDFs={len(paper.get('pdfUrls',[]))}")
+        papers = papers[:count]
+        log("SEMANTIC", f"Found {len(papers)} papers:")
 
-        if paper['isOA'] or paper.get('oaPdfUrl') or paper.get('pdfUrls'):
-            oa_papers.append(paper)
+        # Save metadata
+        meta_path = os.path.join(output_dir, "papers_list.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(papers, f, ensure_ascii=False, indent=2)
+        log("SEMANTIC", f"List saved: {meta_path}")
 
-    # 优先管理学期刊
-    good = [p for p in oa_papers if is_good_venue(p.get('venue', ''))]
-    other = [p for p in oa_papers if not is_good_venue(p.get('venue', ''))]
-    ordered = good + other
+        for i, p in enumerate(papers, 1):
+            sp(f"  {i:2d}. [{p.get('year','?')}] {p['title'][:70]}")
 
-    sp(f"\n  OA 论文总计: {len(oa_papers)} 篇")
-    sp(f"  管理学期刊: {len(good)} 篇")
+        # Download PDFs
+        log("SEMANTIC", f"Downloading {len(papers)} papers...")
+        failed = FailedRecord()
+        downloaded = 0
 
-    # ── 5. 下载 PDF ──────────────────────────────────────────────────────
-    sp("\n[5/5] 下载 PDF...")
-    ensure_output_dir(output_dir)
-    downloaded = []
-    failed = []
-    processed = 0
+        for i, p in enumerate(papers, 1):
+            log("SEMANTIC", f"  [{i}/{len(papers)}] {p['title'][:50]}")
+            try:
+                await page.goto(p["link"], wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(3000)
 
-    for paper in ordered:
-        if processed >= count:
-            break
+                pdf_url = await page.evaluate("""
+                () => {
+                    const links = document.querySelectorAll('a');
+                    for (const a of links) {
+                        const h = a.href || '';
+                        if ((h.includes('/pdf') || h.endsWith('.pdf')) && !h.includes('arxiv')) return h;
+                    }
+                    for (const a of links) {
+                        const t = (a.textContent || '').toLowerCase();
+                        if (t.includes('pdf') || t.includes('download')) return a.href;
+                    }
+                    // arxiv link
+                    for (const a of links) {
+                        const h = a.href || '';
+                        if (h.includes('arxiv.org')) return h.replace('abs', 'pdf');
+                    }
+                    return '';
+                }
+                """)
 
-        title = paper['title']
-        sp(f"\n  --- {processed+1}/{count}: {title[:50]}...")
+                if pdf_url:
+                    # Download via fetch + base64
+                    pdf_b64 = await page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const resp = await fetch('{pdf_url}');
+                            if (!resp.ok) return 'HTTP' + resp.status;
+                            const blob = await resp.blob();
+                            if (blob.size < 1000) return 'TOO_SMALL:' + blob.size;
+                            const buf = await blob.arrayBuffer();
+                            const bytes = new Uint8Array(buf);
+                            let bin = '';
+                            for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+                            return 'data:application/pdf;base64,' + btoa(bin);
+                        }} catch(e) {{ return 'ERR:' + e.message; }}
+                    }}
+                    """)
+                    if pdf_b64 and pdf_b64.startswith("data:application/pdf;base64,"):
+                        raw = base64.b64decode(pdf_b64.split(",")[1])
+                        safe = safe_filename(p["title"], 80).replace(" ", "_")
+                        fname = f"{i:02d}_{safe}.pdf"
+                        fpath = os.path.join(output_dir, fname)
+                        with open(fpath, "wb") as f:
+                            f.write(raw)
+                        log("SEMANTIC", f"  [OK] {fname} ({len(raw)//1024} KB)")
+                        downloaded += 1
+                    else:
+                        failed.add(title=p["title"], link=pdf_url, source="SemanticScholar", reason=f"Fetch failed: {str(pdf_b64)[:40]}")
+                else:
+                    failed.add(title=p["title"], link=p["link"], source="SemanticScholar", reason="No PDF link found")
+            except Exception as e:
+                failed.add(title=p["title"], link=p["link"], source="SemanticScholar", reason=str(e)[:60])
+                log("SEMANTIC", f"  Error: {str(e)[:60]}")
 
-        # 确定 PDF 链接
-        pdf_url = paper.get('oaPdfUrl', '') or ''
-        if not pdf_url:
-            for pu in paper.get('pdfUrls', []):
-                if 'pdf' in pu.lower() or pu.endswith('.pdf'):
-                    pdf_url = pu
-                    break
-        if not pdf_url and paper.get('pdfUrls'):
-            pdf_url = paper['pdfUrls'][0]
+        log("SEMANTIC", f"Done! {downloaded}/{len(papers)} downloaded to {output_dir}")
+        if failed.count > 0:
+            xlsx = failed.save_xlsx(output_dir)
+            log("SEMANTIC", f"Failed records: {xlsx} ({failed.count} papers)")
 
-        if not pdf_url:
-            sp("  [SKIP] 无 PDF 链接")
-            failed.append({
-                "title": title, "venue": paper.get('venue', ''),
-                "doi": paper.get('doi', ''), "link": paper.get('href', ''),
-                "reason": "文章页未找到 PDF 链接"
-            })
-            continue
+    finally:
+        await browser.close()
+        await p.stop()
 
-        sp(f"  PDF URL: {pdf_url[:80]}...")
 
-        try:
-            pdf_b64 = page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const r = await fetch('{pdf_url}', {{
-                            credentials: 'include',
-                            headers: {{ 'Accept': 'application/pdf,*/*' }}
-                        }});
-                        if (!r.ok) return 'HTTP_ERROR:' + r.status;
-                        const b = await r.blob();
-                        const reader = new FileReader();
-                        return await new Promise(res => {{
-                            reader.onloadend = () => res(reader.result.split(',')[1]);
-                            reader.readAsDataURL(b);
-                        }});
-                    }} catch(e) {{ return 'FETCH_ERROR:' + e.message; }}
-                }}
-            """)
-
-            if pdf_b64 and not pdf_b64.startswith("ERROR") and not pdf_b64.startswith("HTTP_"):
-                fname = safe_filename(title, 60) + ".pdf"
-                fpath = os.path.join(output_dir, fname)
-                with open(fpath, "wb") as f:
-                    f.write(base64.b64decode(pdf_b64))
-                sp(f"  [OK] -> {fname}")
-                downloaded.append({"title": title, "file": fname})
-                processed += 1
-            else:
-                sp(f"  [FAIL] {str(pdf_b64)[:80]}")
-                failed.append({
-                    "title": title, "venue": paper.get('venue', ''),
-                    "doi": paper.get('doi', ''), "link": paper.get('href', ''),
-                    "reason": str(pdf_b64)[:100]
-                })
-        except Exception as e:
-            sp(f"  [FAIL] {e}")
-            failed.append({
-                "title": title, "venue": paper.get('venue', ''),
-                "doi": paper.get('doi', ''), "link": paper.get('href', ''),
-                "reason": str(e)[:100]
-            })
-
-    # ── 结果汇总 ──────────────────────────────────────────────────────────
-    sp("\n" + "=" * 60)
-    sp("结果汇总")
-    sp("=" * 60)
-    sp(f"下载成功: {len(downloaded)} 篇")
-    for d in downloaded:
-        sp(f"  [OK] {d['title'][:60]}")
-
-    sp(f"\n下载失败: {len(failed)} 篇")
-    for f_rec in failed:
-        sp(f"  [FAIL] {f_rec['title'][:60]}")
-        sp(f"         原因: {f_rec.get('reason', '')[:60]}")
-
-    # 保存失败记录 Excel
-    if failed:
-        xlsx_path = os.path.join(output_dir, "failed_semanticscholar.xlsx")
-        try:
-            from openpyxl import Workbook, styles
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "失败记录"
-            headers = ["文章名称", "期刊", "DOI", "链接", "失败原因"]
-            for ci, h in enumerate(headers, 1):
-                c = ws.cell(row=1, column=ci, value=h)
-                c.font = styles.Font(bold=True)
-            for ri, f_rec in enumerate(failed, 2):
-                ws.cell(row=ri, column=1, value=f_rec.get("title", ""))
-                ws.cell(row=ri, column=2, value=f_rec.get("venue", ""))
-                ws.cell(row=ri, column=3, value=f_rec.get("doi", ""))
-                ws.cell(row=ri, column=4, value=f_rec.get("link", ""))
-                ws.cell(row=ri, column=5, value=f_rec.get("reason", ""))
-            ws.column_dimensions['A'].width = 50
-            ws.column_dimensions['B'].width = 30
-            ws.column_dimensions['C'].width = 40
-            ws.column_dimensions['D'].width = 50
-            ws.column_dimensions['E'].width = 30
-            wb.save(xlsx_path)
-            sp(f"\n失败记录已保存: {xlsx_path}")
-        except Exception as e:
-            sp(f"  Excel 保存失败，保存 CSV: {e}")
-            csv_path = os.path.join(output_dir, "failed_semanticscholar.csv")
-            with open(csv_path, "w", encoding="utf-8-sig") as f:
-                f.write("文章名称,期刊,DOI,链接,失败原因\n")
-                for f_rec in failed:
-                    f.write(f"{f_rec.get('title','')},{f_rec.get('venue','')},{f_rec.get('doi','')},{f_rec.get('link','')},{f_rec.get('reason','')}\n")
-            sp(f"   CSV 已保存: {csv_path}")
-
-    playwright.stop()
-    sp("\n完成!")
+def main(args_text: str):
+    """同步入口"""
+    asyncio.run(main_async(args_text))
 
 
 if __name__ == "__main__":
